@@ -1,97 +1,134 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# Cars24 SDUI
 
-# Getting Started
+Server-Driven UI system for the Cars24 Home/Landing page. The server sends
+JSON; the client renders it. Changing the JSON changes the UI — no app
+release needed.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+Built with React Native 0.86 + TypeScript, as a single-platform assessment
+project (not a production app).
 
-## Step 1: Start Metro
-
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
-
-To start the Metro dev server, run the following command from the root of your React Native project:
-
-```sh
-# Using npm
-npm start
-
-# OR using Yarn
-yarn start
-```
-
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
+## Setup
 
 ```sh
-# Using npm
-npm run android
+pnpm install
 
-# OR using Yarn
-yarn android
-```
-
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
+# iOS only, first run and after any native dep change
 bundle install
+bundle exec pod install --project-directory=ios
+
+pnpm start        # Metro
+pnpm android       # or
+pnpm ios
 ```
 
-Then, and every time you update your native dependencies, run:
+Two screens are registered in the stack navigator:
 
-```sh
-bundle exec pod install
+- `HomeSDUI` — the JSON-driven page (`src/features/home`)
+- `HomeStatic` — the same page hardcoded, for perf comparison (`src/features/static`)
+
+## Architecture
+
+```text
+JSON (MockData.ts locally, or a hosted endpoint)
+      ↓
+useHomePage()            TanStack Query — fetch, cache, retry
+      ↓
+Screen.tsx                loading / error / skeleton states
+      ↓
+SDUIRenderer.tsx           FlashList over sections[]
+      ↓
+ComponentRegistry.ts       type string → React component
+      ↓
+SDUIErrorBoundary          class component — catches render errors per section
+      ↓
+ActionHandler.ts            centralizes all tap → navigate/state/sheet dispatch
+      ↓
+Native RN components        the actual views
 ```
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+Every section is wrapped in its own `SDUIErrorBoundary`. One malformed
+component can't take down the page — it falls back to
+`UnknownFallbackComponent` and the rest of the list keeps rendering.
 
-```sh
-# Using npm
-npm run ios
+## Schema
 
-# OR using Yarn
-yarn ios
+```ts
+type SDUIPage = {
+  version: string;       // semver
+  screen_id: string;
+  sections: SDUIComponent[];
+};
+
+type SDUIComponent = {
+  id: string;             // stable, used as list key
+  type: string;           // → ComponentRegistry key
+  props: Record<string, unknown>;
+  action?: SDUIAction;
+  fallback?: 'hide' | 'placeholder' | 'skeleton';
+  layout?: SDUILayout;    // server-driven style overrides
+  metadata?: SDUIMetadata; // analytics + A/B testing
+};
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+**Why `type` as a string, not an enum?** A string lets the server ship a
+brand-new component type without a client release. An enum would need a
+client code change (and app store review) for every new section type —
+defeating the point of SDUI.
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+**Why `metadata`?** Cars24 tracks impressions on every rendered section.
+`analytics_id` + `log_impression` let the server opt sections into tracking
+without the client hardcoding which sections matter. `experiment_id` makes
+SDUI double as an A/B testing layer — the server decides which variant a
+user sees, zero client change.
 
-## Step 3: Modify your app
+**Why no visibility conditions?** The original design considered a
+`SDUIVisibility` field with a string condition the client would `eval()`.
+Removed it — evaluating server-sent strings as code is a straightforward
+injection vector. The client should never execute logic it didn't ship
+with. Conditional rendering is handled server-side instead: if a section
+shouldn't render for a user, the server simply omits it from `sections[]`.
 
-Now that you have successfully run the app, let's make changes!
+**Why ErrorBoundary instead of try/catch?** React doesn't propagate
+render-phase errors to a surrounding try/catch — they only reach
+`componentDidCatch`/`getDerivedStateFromError` on a class component above
+the failing subtree. `SDUIErrorBoundary` wraps each section individually so
+one bad component degrades to a fallback instead of crashing the screen.
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+**Why does each `category_chips` item carry its own `action`, not the
+section?** Buy/Sell/Loan/RC Transfer are functionally different — three do
+`update_state`, one does `navigate`. A single section-level action can't
+express four different behaviors, so the action lives per chip.
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+**Why semver on every payload?** Old client + new JSON: unknown component
+types render nothing (prod) via `UnknownFallbackComponent`, page still
+works. New client + old JSON: new components simply don't appear in the
+payload. A MAJOR version bump is the only case that should prompt
+"please update your app" — MINOR/PATCH are fully backward compatible.
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+## Known trade-offs
 
-## Congratulations! :tada:
+1. **No real network layer.** `fetchHomePage()` returns local `MockData`
+   with a simulated 80ms delay. `HttpsClient.ts` (Axios instance) is wired
+   and ready — swapping to a real endpoint is a one-line change in
+   `GetApiServices.ts`. Production would add caching, retry/backoff, and
+   stale-while-revalidate (TanStack Query already gives most of this for
+   free once a real URL is in place).
+2. **Icons are a single glyph, not Ionicons.** The JSON references icon
+   names like `shield-checkmark` / `car-outline`, but `react-native-vector-icons`
+   wasn't part of the planned dependency set, so `ValuePropStripComponent`
+   renders a plain checkmark instead of resolving those names. Would add
+   the icon library if exact icons mattered.
+3. **`@d11/react-native-fast-image`, not the original.** The unmaintained
+   original doesn't declare React 19 support (peer dep caps at React 18).
+   The `@d11` fork is the maintained, New Architecture–compatible drop-in
+   replacement with an identical API.
+4. **Perf numbers not yet measured on-device.** See [PERF.md](PERF.md) —
+   the release APK builds clean and the `perf.ts` markers are wired into
+   real code paths, but this environment has no physical Android device to
+   run the cold-open methodology on.
 
-You've successfully run and modified your React Native App. :partying_face:
+## Folder structure
 
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+See `CLAUDE.md` for the full planned structure. Actual layout matches it,
+with `src/sdui/`, `src/components/`, `src/features/{home,static}/`,
+`src/stores/`, `src/services/`, `src/navigation/`.
